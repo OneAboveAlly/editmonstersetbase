@@ -4,6 +4,7 @@ from PIL import Image, ImageTk
 import os
 import re
 import random
+import copy  # For deep copying spawns for undo/redo functionality
 
 class MonsterSpawnEditor:
     def __init__(self, root):
@@ -12,6 +13,15 @@ class MonsterSpawnEditor:
         
         # Set program icon if available
         self.set_program_icon()
+        
+        # Initialize undo/redo stacks
+        self.undo_stack = []
+        self.redo_stack = []
+        self.max_history = 20  # Maximum number of actions to keep in history
+        
+        # Dictionary to store spawns for each map
+        self.map_spawns = {}
+        self.modified_maps = set()  # Track which maps have been modified
         
         # MU Online style
         style = ttk.Style()
@@ -48,9 +58,10 @@ class MonsterSpawnEditor:
         self.root.minsize(1200, 800)
         self.root.state('zoomed')
         
-        # Configure row and column weights for resizing
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        # Configure row and column weights for resizing - GŁÓWNA ZMIANA DLA RESPONSYWNOŚCI
+        self.root.columnconfigure(0, weight=1)  # Główna kolumna rozciąga się
+        self.root.rowconfigure(0, weight=1)     # Główny wiersz rozciąga się
+        self.root.rowconfigure(1, weight=0)     # Status bar ma stałą wysokość
         
         # Initialize dictionaries
         self.monsters = {}
@@ -73,9 +84,9 @@ class MonsterSpawnEditor:
         self.main_frame = ttk.Frame(root, padding="10")
         self.main_frame.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.E, tk.W))
         
-        # Configure main frame for resizing
-        self.main_frame.columnconfigure(0, weight=1, minsize=350)  # Left panel
-        self.main_frame.columnconfigure(1, weight=3, minsize=700)  # Right panel (map view)
+        # Configure main frame for resizing - LEPSZE PROPORCJE
+        self.main_frame.columnconfigure(0, weight=2, minsize=350)  # Left panel (proporcja 2)
+        self.main_frame.columnconfigure(1, weight=5, minsize=700)  # Right panel (proporcja 5)
         self.main_frame.rowconfigure(0, weight=1)
         
         # Create menu
@@ -99,18 +110,45 @@ class MonsterSpawnEditor:
         
         # Add status bar at the bottom
         self.create_status_bar()
+        
+        # Bind closing event
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def set_program_icon(self):
         """Set the program icon if the icon file exists"""
         icon_path = "icon.ico"
         if os.path.exists(icon_path):
             self.root.iconbitmap(icon_path)
+            # Dla Windows, ustaw także ikonę w pasku zadań
+            try:
+                import ctypes
+                myappid = f'shizoo.monsterspawneditor.1.0'  # arbitrary string
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+            except Exception as e:
+                print(f"Warning: Could not set taskbar icon: {str(e)}")
         else:
             print("Icon file not found. Place 'icon.ico' in the program directory to set custom icon.")
 
     def load_monster_data(self, filename):
         """Load basic monster data (ID, name, and type) from Monster.txt"""
         try:
+            # Sprawdź czy katalog Monster istnieje, jeśli nie - utwórz go
+            if not os.path.exists("Monster"):
+                try:
+                    os.makedirs("Monster")
+                    self.status_var.set("Created Monster directory")
+                    messagebox.showinfo("Directory Created", "Monster directory was created. Place your Monster.txt file in this directory.")
+                    return
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to create Monster directory: {str(e)}")
+                    return
+            
+            # Sprawdź czy plik Monster.txt istnieje
+            if not os.path.exists(filename):
+                self.status_var.set(f"File {filename} not found")
+                messagebox.showinfo("File Not Found", f"{filename} not found. Create or copy this file to the Monster directory.")
+                return
+            
             with open(filename, 'r') as f:
                 lines = f.readlines()
                 for line in lines:
@@ -159,6 +197,9 @@ class MonsterSpawnEditor:
                                 print(f"Found Spider in load_monster_data: ID={monster_id}, Name={full_name}, InitialType={monster_type}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load monster data: {str(e)}")
+            # Inicjalizuj pustą listę, aby uniknąć błędów w innych miejscach
+            if not self.monsters:
+                self.monsters = {}
 
     def create_menu(self):
         menubar = tk.Menu(self.root)
@@ -166,26 +207,66 @@ class MonsterSpawnEditor:
         
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(label="Load Map", command=self.load_map_dialog)
-        file_menu.add_command(label="Save", command=self.save_changes)
+        file_menu.add_command(label="Load Map", command=self.load_map_dialog, accelerator="Ctrl+O")
+        file_menu.add_command(label="Save", command=self.save_changes, accelerator="Ctrl+S")
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
+        file_menu.add_command(label="Exit", command=self.on_closing, accelerator="Alt+F4")
+        
+        # Create Edit menu separately and store references to menu items
+        edit_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Edit", menu=edit_menu)
+        
+        # Add Undo/Redo commands and store indices
+        self.undo_index = 0  # First item (index 0)
+        edit_menu.add_command(label="Undo", command=self.undo, accelerator="Ctrl+Z", state="disabled")
+        
+        self.redo_index = 1  # Second item (index 1)
+        edit_menu.add_command(label="Redo", command=self.redo, accelerator="Ctrl+Y", state="disabled")
+        
+        edit_menu.add_separator()  # This will be index 2
+        edit_menu.add_command(label="Delete Selected Spawn", command=self.delete_selected_spawn, accelerator="Del")
+        
+        self.edit_menu = edit_menu  # Store reference to edit menu
+        
+        view_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="View", menu=view_menu)
+        
+        # Opcja do pokazania/ukrycia mobów
+        self.view_mobs_var = tk.BooleanVar(value=True)
+        view_menu.add_checkbutton(label="Show Mobs", variable=self.view_mobs_var, command=self.toggle_mobs_visibility_menu)
+        
+        # Opcje zmiany skali
+        view_menu.add_separator()
+        view_menu.add_command(label="Zoom In", command=self.zoom_in, accelerator="Ctrl++")
+        view_menu.add_command(label="Zoom Out", command=self.zoom_out, accelerator="Ctrl+-")
+        view_menu.add_command(label="Reset Zoom", command=self.reset_zoom, accelerator="Ctrl+0")
         
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
         help_menu.add_command(label="Instructions", command=self.show_instructions)
         help_menu.add_command(label="About", command=self.show_about)
+        
+        # Bind keyboard shortcuts
+        self.root.bind("<Control-o>", lambda e: self.load_map_dialog())
+        self.root.bind("<Control-s>", lambda e: self.save_changes())
+        self.root.bind("<Delete>", lambda e: self.delete_selected_spawn())
+        self.root.bind("<Control-plus>", lambda e: self.zoom_in())
+        self.root.bind("<Control-equal>", lambda e: self.zoom_in())  # Dla klawiatury amerykańskiej
+        self.root.bind("<Control-minus>", lambda e: self.zoom_out())
+        self.root.bind("<Control-0>", lambda e: self.reset_zoom())
+        self.root.bind("<Control-z>", lambda e: self.undo())
+        self.root.bind("<Control-y>", lambda e: self.redo())
 
     def create_panels(self):
         # Left panel
         self.left_panel = ttk.Frame(self.main_frame)
         self.left_panel.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.E, tk.W))
         
-        # Configure left panel for resizing
-        self.left_panel.columnconfigure(0, weight=1)
+        # Configure left panel for resizing - POPRAWIONA RESPONSYWNOŚĆ
+        self.left_panel.columnconfigure(0, weight=1)  # Kolumna rozciąga się na całą szerokość
         self.left_panel.rowconfigure(0, weight=1)  # Map selection
         self.left_panel.rowconfigure(1, weight=1)  # Monster list
-        self.left_panel.rowconfigure(2, weight=2)  # Monster stats
+        self.left_panel.rowconfigure(2, weight=2)  # Monster stats (większa proporcja)
         
         # Map selection
         self.create_map_selection()
@@ -200,8 +281,8 @@ class MonsterSpawnEditor:
         self.right_panel = ttk.Frame(self.main_frame)
         self.right_panel.grid(row=0, column=1, sticky=(tk.N, tk.S, tk.E, tk.W))
         
-        # Configure right panel for resizing
-        self.right_panel.columnconfigure(0, weight=1)
+        # Configure right panel for resizing - POPRAWIONA RESPONSYWNOŚĆ
+        self.right_panel.columnconfigure(0, weight=1)  # Kolumna rozciąga się
         self.right_panel.rowconfigure(0, weight=4)  # Map view (larger)
         self.right_panel.rowconfigure(1, weight=1)  # Spawn list
         
@@ -215,6 +296,12 @@ class MonsterSpawnEditor:
         status_frame = ttk.Frame(self.root, relief=tk.SUNKEN, padding=(2, 2, 2, 2))
         status_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.S))
         
+        # Configure status frame for resizing
+        status_frame.columnconfigure(0, weight=3)  # Status message (proportion 3)
+        status_frame.columnconfigure(1, weight=1)  # Coordinates (proportion 1)
+        status_frame.columnconfigure(2, weight=1)  # Scale (proportion 1)
+        status_frame.columnconfigure(3, weight=1)  # Modified indicator (proportion 1)
+        
         self.status_var = tk.StringVar(value="Ready")
         status_label = ttk.Label(status_frame, textvariable=self.status_var, anchor=tk.W)
         status_label.grid(row=0, column=0, sticky=(tk.W, tk.E))
@@ -224,14 +311,21 @@ class MonsterSpawnEditor:
         coordinates_label = ttk.Label(status_frame, textvariable=self.coordinates_var, anchor=tk.E)
         coordinates_label.grid(row=0, column=1, sticky=(tk.E))
         
-        status_frame.columnconfigure(0, weight=1)
-        status_frame.columnconfigure(1, weight=1)
+        # Add scale display in status bar
+        self.scale_var = tk.StringVar(value="Scale: 100%")
+        scale_label = ttk.Label(status_frame, textvariable=self.scale_var, anchor=tk.E)
+        scale_label.grid(row=0, column=2, sticky=(tk.E), padx=(10, 0))
+        
+        # Add modified indicator
+        self.modified_var = tk.StringVar(value="")
+        modified_label = ttk.Label(status_frame, textvariable=self.modified_var, anchor=tk.E, foreground="red")
+        modified_label.grid(row=0, column=3, sticky=(tk.E), padx=(10, 0))
 
     def create_map_selection(self):
         map_frame = ttk.LabelFrame(self.left_panel, text="Map Selection")
         map_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
         
-        # Configure map frame for resizing
+        # Configure map frame for resizing - POPRAWIONA RESPONSYWNOŚĆ
         map_frame.columnconfigure(0, weight=1)
         map_frame.rowconfigure(0, weight=1)
         
@@ -257,10 +351,12 @@ class MonsterSpawnEditor:
         monster_frame = ttk.LabelFrame(self.left_panel, text="New Mob Selection")
         monster_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
         
-        # Configure monster frame for resizing
-        monster_frame.columnconfigure(0, weight=1)
-        monster_frame.columnconfigure(1, weight=3)
-        monster_frame.rowconfigure(1, weight=1)
+        # Configure monster frame for resizing - POPRAWIONA RESPONSYWNOŚĆ
+        monster_frame.columnconfigure(0, weight=0)  # Etykieta nie rozciąga się
+        monster_frame.columnconfigure(1, weight=1)  # Pole wyszukiwania rozciąga się
+        monster_frame.rowconfigure(0, weight=0)     # Wyszukiwarka ma stałą wysokość
+        monster_frame.rowconfigure(1, weight=1)     # Lista potworów rozciąga się
+        monster_frame.rowconfigure(2, weight=0)     # Kontrolki ilości mają stałą wysokość
         
         # Search
         ttk.Label(monster_frame, text="Search:").grid(row=0, column=0, sticky=tk.W)
@@ -279,10 +375,14 @@ class MonsterSpawnEditor:
         self.monster_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         self.monster_listbox.bind('<<ListboxSelect>>', self.on_monster_selected)
         
-        # Add scrollbars
+        # Add scrollbars - DODANO POZIOMY SCROLLBAR
         monster_y_scroll = ttk.Scrollbar(monster_list_frame, orient="vertical", command=self.monster_listbox.yview)
         monster_y_scroll.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        self.monster_listbox.configure(yscrollcommand=monster_y_scroll.set)
+        
+        monster_x_scroll = ttk.Scrollbar(monster_list_frame, orient="horizontal", command=self.monster_listbox.xview)
+        monster_x_scroll.grid(row=1, column=0, sticky=(tk.W, tk.E))
+        
+        self.monster_listbox.configure(yscrollcommand=monster_y_scroll.set, xscrollcommand=monster_x_scroll.set)
         
         # Quantity field for monsters (not used for NPCs)
         quantity_frame = ttk.Frame(monster_frame)
@@ -307,18 +407,26 @@ class MonsterSpawnEditor:
 
     def create_monster_stats(self):
         stats_frame = ttk.LabelFrame(self.left_panel, text="Selected Monster Stats")
-        stats_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), padx=5, pady=5)
+        stats_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)  # Dodano N, S dla lepszego rozciągania
+        
+        # Poprawiona responsywność - frame ma lepszy podział
+        stats_frame.columnconfigure(0, weight=1)
+        stats_frame.rowconfigure(0, weight=1)
         
         # Stats grid - create a frame to hold all the stats
         stats_container = ttk.Frame(stats_frame)
-        stats_container.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        stats_container.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))  # Dodano N, S dla lepszego rozciągania
+        stats_container.columnconfigure(0, weight=1)
+        stats_container.columnconfigure(1, weight=1)
+        stats_container.columnconfigure(2, weight=1)
         
         self.stat_vars = {}
         self.stat_entries = {}
         
         # First row - basic info
         name_frame = ttk.Frame(stats_container)
-        name_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=2)
+        name_frame.grid(row=0, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=2)
+        name_frame.columnconfigure(1, weight=1)  # Pole nazwy rozciąga się
         
         ttk.Label(name_frame, text="Name:").grid(row=0, column=0, sticky=tk.W)
         name_var = tk.StringVar()
@@ -327,8 +435,87 @@ class MonsterSpawnEditor:
         name_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5)
         self.stat_entries["name"] = name_entry
         
-        # Create 3-column grid for stats
-        row = 1
+        # Dodaj pola do edycji koordynatów dla wybranego spawna
+        spawn_coords_frame = ttk.LabelFrame(stats_container, text="Spawn Coordinates")
+        spawn_coords_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        
+        # Konfiguracja responsywności dla ramki koordynatów
+        spawn_coords_frame.columnconfigure(0, weight=0)  # Etykieta
+        spawn_coords_frame.columnconfigure(1, weight=1)  # Pole X
+        spawn_coords_frame.columnconfigure(2, weight=0)  # Etykieta
+        spawn_coords_frame.columnconfigure(3, weight=1)  # Pole Y
+        
+        # Zmienne dla koordynatów X, Y
+        self.spawn_x_var = tk.IntVar(value=0)
+        self.spawn_y_var = tk.IntVar(value=0)
+        self.spawn_end_x_var = tk.IntVar(value=0)
+        self.spawn_end_y_var = tk.IntVar(value=0)
+        
+        # Koordynaty punktu początkowego
+        ttk.Label(spawn_coords_frame, text="Start X:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
+        spawn_x_entry = ttk.Entry(spawn_coords_frame, textvariable=self.spawn_x_var, width=5)
+        spawn_x_entry.grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(spawn_coords_frame, text="Start Y:").grid(row=0, column=2, sticky=tk.W, padx=5, pady=2)
+        spawn_y_entry = ttk.Entry(spawn_coords_frame, textvariable=self.spawn_y_var, width=5)
+        spawn_y_entry.grid(row=0, column=3, sticky=tk.W, padx=5, pady=2)
+        
+        # Koordynaty punktu końcowego (dla obszarów)
+        ttk.Label(spawn_coords_frame, text="End X:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
+        spawn_end_x_entry = ttk.Entry(spawn_coords_frame, textvariable=self.spawn_end_x_var, width=5)
+        spawn_end_x_entry.grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(spawn_coords_frame, text="End Y:").grid(row=1, column=2, sticky=tk.W, padx=5, pady=2)
+        spawn_end_y_entry = ttk.Entry(spawn_coords_frame, textvariable=self.spawn_end_y_var, width=5)
+        spawn_end_y_entry.grid(row=1, column=3, sticky=tk.W, padx=5, pady=2)
+        
+        # Przycisk do aktualizacji koordynatów
+        update_coords_button = ttk.Button(spawn_coords_frame, text="Update Coordinates", command=self.update_spawn_coordinates)
+        update_coords_button.grid(row=2, column=0, columnspan=4, sticky=tk.E, padx=5, pady=5)
+        
+        # Ukryj pola koordynatów na początku (będą widoczne tylko po wybraniu spawna)
+        spawn_coords_frame.grid_remove()
+        self.spawn_coords_frame = spawn_coords_frame
+        
+        # Create 3-column grid for stats with scrollable area
+        row = 2  # Zmienione z 1 na 2, żeby uwzględnić ramkę koordynatów
+        
+        # Utwórz ramkę z przewijaniem dla statystyk - NOWA FUNKCJONALNOŚĆ DLA LEPSZEJ RESPONSYWNOŚCI
+        stats_scroll_frame = ttk.Frame(stats_container)
+        stats_scroll_frame.grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        stats_scroll_frame.columnconfigure(0, weight=1)
+        stats_scroll_frame.rowconfigure(0, weight=1)
+        
+        # Canvas do przewijania
+        stats_canvas = tk.Canvas(stats_scroll_frame, borderwidth=0, highlightthickness=0, background='#181c24')
+        stats_canvas.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Scrollbar
+        stats_scrollbar = ttk.Scrollbar(stats_scroll_frame, orient="vertical", command=stats_canvas.yview)
+        stats_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        stats_canvas.configure(yscrollcommand=stats_scrollbar.set)
+        
+        # Wewnętrzna ramka dla statystyk
+        stats_inner_frame = ttk.Frame(stats_canvas)
+        stats_inner_frame.columnconfigure(0, weight=1)
+        stats_inner_frame.columnconfigure(1, weight=1)
+        stats_inner_frame.columnconfigure(2, weight=1)
+        
+        # Dodaj ramkę do canvas
+        stats_canvas.create_window((0, 0), window=stats_inner_frame, anchor="nw", tags="stats_inner_frame")
+        
+        # Konfiguruj canvas do przewijania
+        def _configure_stats_canvas(event):
+            # Ustaw scrollregion na podstawie rozmiaru wewnętrznej ramki
+            stats_canvas.configure(scrollregion=stats_canvas.bbox("all"))
+            # Ustaw szerokość wewnętrznej ramki na szerokość canvas
+            width = event.width
+            stats_canvas.itemconfig("stats_inner_frame", width=width)
+        
+        stats_canvas.bind("<Configure>", _configure_stats_canvas)
+        stats_inner_frame.bind("<Configure>", lambda e: stats_canvas.configure(scrollregion=stats_canvas.bbox("all")))
+        
+        # Definicje statystyk
         stats = [
             # First column
             [("ID", "id", 5), ("Rate", "attackrate", 5), ("Level", "level", 5), 
@@ -344,9 +531,10 @@ class MonsterSpawnEditor:
              ("RIce", "resistice", 5), ("RWtr", "resistwater", 5), ("RFire", "resistfire", 5)]
         ]
         
+        # Dodawanie statystyk do ramki z przewijaniem
         for col, col_stats in enumerate(stats):
-            col_frame = ttk.Frame(stats_container)
-            col_frame.grid(row=row, column=col, sticky=(tk.N, tk.W), padx=5, pady=5)
+            col_frame = ttk.Frame(stats_inner_frame)
+            col_frame.grid(row=0, column=col, sticky=(tk.N, tk.W), padx=5, pady=5)
             
             for i, (label, key, width) in enumerate(col_stats):
                 ttk.Label(col_frame, text=label).grid(row=i, column=0, sticky=tk.W)
@@ -361,8 +549,8 @@ class MonsterSpawnEditor:
                 self.stat_entries[key] = spinbox
         
         # Element stats (in another row below)
-        element_frame = ttk.Frame(stats_container)
-        element_frame.grid(row=row+1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        element_frame = ttk.Frame(stats_inner_frame)
+        element_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
         
         element_stats = [
             ("Element", "element", 5), ("MinElem", "minelement", 5), ("MaxElem", "maxelement", 5), 
@@ -380,12 +568,12 @@ class MonsterSpawnEditor:
             self.stat_entries[key] = spinbox
         
         # Update button
-        update_button = ttk.Button(stats_container, text="Update Mob Stats", command=self.update_monster_stats)
-        update_button.grid(row=row+2, column=0, columnspan=3, sticky=(tk.E), pady=5)
+        update_button = ttk.Button(stats_inner_frame, text="Update Mob Stats", command=self.update_monster_stats)
+        update_button.grid(row=2, column=0, columnspan=3, sticky=(tk.E), pady=5)
         
         # Bottom controls section (Direction and Mob Type side by side)
-        controls_frame = ttk.Frame(stats_container)
-        controls_frame.grid(row=row+3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        controls_frame = ttk.Frame(stats_inner_frame)
+        controls_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
         controls_frame.columnconfigure(0, weight=1)
         controls_frame.columnconfigure(1, weight=1)
         
@@ -452,9 +640,10 @@ class MonsterSpawnEditor:
         map_frame = ttk.LabelFrame(self.right_panel, text="Map View")
         map_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
         
-        # Configure map frame for resizing
+        # Configure map frame for resizing - POPRAWIONA RESPONSYWNOŚĆ
         map_frame.columnconfigure(0, weight=1)
         map_frame.rowconfigure(0, weight=1)
+        map_frame.rowconfigure(1, weight=0)  # Scrollbar horyzontalny ma stałą wysokość
         
         # Canvas for map with frame for proper resizing
         canvas_frame = ttk.Frame(map_frame)
@@ -462,7 +651,7 @@ class MonsterSpawnEditor:
         canvas_frame.columnconfigure(0, weight=1)
         canvas_frame.rowconfigure(0, weight=1)
         
-        # Canvas for map
+        # Canvas for map - DODANO MIN SIZE DLA POPRAWY RESPONSYWNOŚCI
         self.map_canvas = tk.Canvas(canvas_frame, width=800, height=600, bg="light gray")
         self.map_canvas.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
@@ -480,22 +669,33 @@ class MonsterSpawnEditor:
         self.map_canvas.bind("<Button-1>", self.on_mouse_down)
         self.map_canvas.bind("<B1-Motion>", self.on_mouse_drag)
         self.map_canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
+        
+        # Bind window resize event to update canvas scaling
+        self.root.bind("<Configure>", self.on_window_resize)
 
     def create_spawn_list(self):
         """Create a panel to display and manage current spawns"""
         spawn_frame = ttk.LabelFrame(self.right_panel, text="Mobs on Selected Map")
         spawn_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
-        # Configure spawn frame for resizing
+        
+        # Configure spawn frame for resizing - POPRAWIONA RESPONSYWNOŚĆ
         spawn_frame.columnconfigure(0, weight=1)
-        spawn_frame.rowconfigure(1, weight=1)
+        spawn_frame.rowconfigure(0, weight=0)  # Search ma stałą wysokość
+        spawn_frame.rowconfigure(1, weight=0)  # Hide mobs ma stałą wysokość
+        spawn_frame.rowconfigure(2, weight=1)  # Lista spawnów rozciąga się
+        spawn_frame.rowconfigure(3, weight=0)  # Przyciski mają stałą wysokość
+        
         # WYSZUKIWARKA
         search_frame = ttk.Frame(spawn_frame)
         search_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=5, pady=(2, 0))
+        search_frame.columnconfigure(1, weight=1)  # Pole wyszukiwania rozciąga się
+        
         ttk.Label(search_frame, text="Search:").grid(row=0, column=0, sticky=tk.W)
         self.spawn_search_var = tk.StringVar()
         self.spawn_search_var.trace('w', self.update_spawn_list)
         search_entry = ttk.Entry(search_frame, textvariable=self.spawn_search_var, width=30)
         search_entry.grid(row=0, column=1, sticky=(tk.W, tk.E))
+        
         # Add checkbox to hide mobs
         hide_mobs_frame = ttk.Frame(spawn_frame)
         hide_mobs_frame.grid(row=1, column=0, sticky=(tk.W), padx=5, pady=2)
@@ -503,23 +703,33 @@ class MonsterSpawnEditor:
         hide_mobs_cb = ttk.Checkbutton(hide_mobs_frame, text="Hide Mobs", variable=self.hide_mobs_var, 
                                       command=self.toggle_mobs_visibility)
         hide_mobs_cb.grid(row=0, column=0, sticky=tk.W)
+        
         # Create spawn list with scrollbar
         spawn_list_frame = ttk.Frame(spawn_frame)
         spawn_list_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
+        
         # Configure spawn list frame for resizing
         spawn_list_frame.columnconfigure(0, weight=1)
         spawn_list_frame.rowconfigure(0, weight=1)
+        
         # Spawn list
         self.spawn_listbox = tk.Listbox(spawn_list_frame, height=10, width=50)
         self.spawn_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         self.spawn_listbox.bind('<<ListboxSelect>>', self.on_spawn_selected)
-        # Scrollbar for spawn list
-        spawn_scrollbar = ttk.Scrollbar(spawn_list_frame, orient="vertical", command=self.spawn_listbox.yview)
-        spawn_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        self.spawn_listbox.configure(yscrollcommand=spawn_scrollbar.set)
+        
+        # Scrollbar for spawn list - DODANO POZIOMY SCROLLBAR
+        spawn_y_scrollbar = ttk.Scrollbar(spawn_list_frame, orient="vertical", command=self.spawn_listbox.yview)
+        spawn_y_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+        spawn_x_scrollbar = ttk.Scrollbar(spawn_list_frame, orient="horizontal", command=self.spawn_listbox.xview)
+        spawn_x_scrollbar.grid(row=1, column=0, sticky=(tk.W, tk.E))
+        
+        self.spawn_listbox.configure(yscrollcommand=spawn_y_scrollbar.set, xscrollcommand=spawn_x_scrollbar.set)
+        
         # Button frame
         button_frame = ttk.Frame(spawn_frame)
         button_frame.grid(row=3, column=0, sticky=(tk.E), padx=5, pady=5)
+        
         # Remove button
         delete_button = ttk.Button(button_frame, text="Remove", command=self.delete_selected_spawn)
         delete_button.grid(row=0, column=0, sticky=(tk.E), padx=5)
@@ -623,9 +833,29 @@ class MonsterSpawnEditor:
 
     def load_available_maps(self):
         self.map_listbox.delete(0, tk.END)
-        for file in sorted(os.listdir("MonsterSetBase")):
-            if file.endswith(".txt") and not file.startswith("Event"):
-                self.map_listbox.insert(tk.END, file)
+        
+        # Sprawdź czy katalog istnieje, jeśli nie - utwórz go
+        if not os.path.exists("MonsterSetBase"):
+            try:
+                os.makedirs("MonsterSetBase")
+                self.status_var.set("Created MonsterSetBase directory")
+                messagebox.showinfo("Directory Created", "MonsterSetBase directory was created. Place your map files in this directory.")
+                return
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to create MonsterSetBase directory: {str(e)}")
+                return
+        
+        # Wczytaj pliki map
+        try:
+            files = sorted(os.listdir("MonsterSetBase"))
+            for file in files:
+                if file.endswith(".txt") and not file.startswith("Event"):
+                    self.map_listbox.insert(tk.END, file)
+            
+            if not files:
+                self.status_var.set("No map files found in MonsterSetBase directory")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load maps: {str(e)}")
 
     def load_map_dialog(self):
         # Open file dialog to select map file
@@ -639,6 +869,11 @@ class MonsterSpawnEditor:
             self.load_map(map_file)
 
     def load_map(self, map_file):
+        # Clear undo/redo stacks when loading a new map
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.update_undo_redo_states()
+        
         try:
             # Load map data
             with open(f"MonsterSetBase/{map_file}", 'r') as f:
@@ -705,6 +940,10 @@ class MonsterSpawnEditor:
                         print(f"Warning: Skipping malformed line: {line}")
                         # Możesz też dodać ostrzeżenie dla użytkownika:
                         # messagebox.showwarning("Malformed line", f"Skipped line: {line}")
+                        
+            # Save spawns to memory
+            self.map_spawns[map_file] = copy.deepcopy(self.spawns)
+            
             # Po wczytaniu mapy automatycznie zaznacz ją na liście
             for idx in range(self.map_listbox.size()):
                 if self.map_listbox.get(idx) == map_file:
@@ -729,9 +968,29 @@ class MonsterSpawnEditor:
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load map: {str(e)}")
+            
+    def update_modified_indicator(self):
+        """Update the modified indicator in status bar"""
+        if hasattr(self, 'modified_var') and hasattr(self, 'selected_map_file'):
+            if self.selected_map_file in self.modified_maps:
+                self.modified_var.set("Modified*")
+            else:
+                self.modified_var.set("")
 
     def find_map_image(self, map_name):
         import os
+        
+        # Sprawdź czy katalog Images istnieje, jeśli nie - utwórz go
+        if not os.path.exists("Images"):
+            try:
+                os.makedirs("Images")
+                self.status_var.set("Created Images directory")
+                messagebox.showinfo("Directory Created", "Images directory was created. Place your map images in this directory.")
+                return None
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to create Images directory: {str(e)}")
+                return None
+        
         kanturu_map_exceptions = {
             'Kanturu 1': 'Kanturu_Ruins.png',
             'Kanturu 2': 'Kanturu_Relics.png',
@@ -770,31 +1029,55 @@ class MonsterSpawnEditor:
                 image = Image.open(image_path)
                 self.original_width = image.width
                 self.original_height = image.height
-                self.original_image = image
+                self.original_image = image  # Zachowaj oryginalny obraz
+                
+                # Pobierz aktualny rozmiar canvas
                 canvas_width = self.map_canvas.winfo_width()
                 canvas_height = self.map_canvas.winfo_height()
+                
+                # Jeśli canvas nie ma jeszcze właściwego rozmiaru, użyj domyślnych wartości
+                if canvas_width <= 1:
+                    canvas_width = 800
+                if canvas_height <= 1:
+                    canvas_height = 600
+                
+                # Oblicz skalę, aby obraz zmieścił się w canvas
                 scale_x = canvas_width / image.width
                 scale_y = canvas_height / image.height
                 self.scale = min(scale_x, scale_y)
+                
+                # Skaluj obraz, jeśli jest za duży dla canvas
                 if self.scale < 1:
                     new_width = int(image.width * self.scale)
                     new_height = int(image.height * self.scale)
-                    image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                self.photo_image = ImageTk.PhotoImage(image)
-                self.map_canvas.create_image(0, 0, image=self.photo_image, anchor="nw")
-                self.map_canvas.configure(scrollregion=(0, 0, self.original_width, self.original_height))
+                    resized_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                    self.photo_image = ImageTk.PhotoImage(resized_image)
+                    self.map_canvas.create_image(0, 0, image=self.photo_image, anchor="nw")
+                    self.map_canvas.configure(scrollregion=(0, 0, new_width, new_height))
+                else:
+                    # Jeśli obraz jest mniejszy niż canvas, wyświetl bez skalowania
+                    self.photo_image = ImageTk.PhotoImage(image)
+                    self.map_canvas.create_image(0, 0, image=self.photo_image, anchor="nw")
+                    self.map_canvas.configure(scrollregion=(0, 0, image.width, image.height))
+                
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load map image: {str(e)}")
         else:
+            # Jeśli nie ma obrazu, utwórz pusty canvas o domyślnych wymiarach
             self.original_width = 800
             self.original_height = 600
             self.scale = 1.0
             self.photo_image = None
-            self.map_canvas.config(width=800, height=600)
+            self.original_image = None
+            
             self.map_canvas.create_rectangle(0, 0, self.original_width, self.original_height, fill="#222", outline="")
             self.map_canvas.configure(scrollregion=(0, 0, self.original_width, self.original_height))
+        
         # Wymuś ponowne bindowanie <Motion> po każdej zmianie mapy
         self.map_canvas.bind("<Motion>", self.on_mouse_move)
+        
+        # Pokaż spawny na nowej mapie
+        self.display_spawns()
 
     def canvas_to_map_coords(self, canvas_x, canvas_y):
         """Convert canvas coordinates to map coordinates (0-255 range)"""
@@ -806,39 +1089,59 @@ class MonsterSpawnEditor:
         raw_x = (canvas_x / self.scale) + scroll_x
         raw_y = (canvas_y / self.scale) + scroll_y
         
+        # Print raw values for debugging
+        print(f"Canvas: ({canvas_x}, {canvas_y}) -> Raw: ({raw_x}, {raw_y})")
+        
+        # Zabezpieczenie przed dzieleniem przez zero
+        if not hasattr(self, 'original_width') or self.original_width <= 0:
+            print("Warning: original_width is zero or not set")
+            return 0, 0
+        
+        if not hasattr(self, 'original_height') or self.original_height <= 0:
+            print("Warning: original_height is zero or not set")
+            return 0, 0
+        
         # Convert to game coordinates (0-255 range)
-        # Based on the requested coordinate system:
-        # - Top-left: (0,0)
-        # - Top-right: (0,255)
-        # - Bottom-left: (255,0)
-        # - Bottom-right: (255,255)
-        map_x = int((raw_y / self.original_height) * 255)  # X increases from top to bottom
-        map_y = int((raw_x / self.original_width) * 255)   # Y increases from left to right
+        # Używamy wartości zmiennoprzecinkowych dla lepszej precyzji
+        map_y_float = (raw_x / self.original_width) * 255.0
+        map_x_float = (raw_y / self.original_height) * 255.0
+        
+        # Stosuj zaokrąglenie matematyczne
+        map_y = int(round(map_y_float))
+        map_x = int(round(map_x_float))
         
         # Ensure coordinates stay within bounds
         map_x = max(0, min(255, map_x))
         map_y = max(0, min(255, map_y))
         
+        print(f"Final map coords: ({map_x}, {map_y})")
+        
         return map_x, map_y
 
     def map_to_canvas_coords(self, map_x, map_y):
         """Convert map coordinates (0-255 range) to canvas coordinates"""
+        # Zabezpieczenie przed dzieleniem przez zero
+        if not hasattr(self, 'original_width') or self.original_width <= 0:
+            print("Warning: original_width is zero or not set")
+            return 0, 0
+        
+        if not hasattr(self, 'original_height') or self.original_height <= 0:
+            print("Warning: original_height is zero or not set")
+            return 0, 0
+        
         # Get current scroll position
         scroll_x = self.map_canvas.xview()[0] * self.original_width
         scroll_y = self.map_canvas.yview()[0] * self.original_height
         
         # Convert from game coordinates (0-255) to image pixel coordinates
-        # Based on the requested coordinate system:
-        # - Top-left: (0,0)
-        # - Top-right: (0,255)
-        # - Bottom-left: (255,0)
-        # - Bottom-right: (255,255)
-        raw_x = (map_y / 255) * self.original_width   # Y maps to horizontal axis
-        raw_y = (map_x / 255) * self.original_height  # X maps to vertical axis
+        raw_x = (map_y / 255.0) * self.original_width
+        raw_y = (map_x / 255.0) * self.original_height
         
         # Apply scale and scroll offset
         canvas_x = (raw_x - scroll_x) * self.scale
         canvas_y = (raw_y - scroll_y) * self.scale
+        
+        print(f"Map: ({map_x}, {map_y}) -> Canvas: ({canvas_x}, {canvas_y})")
         
         return canvas_x, canvas_y
 
@@ -853,26 +1156,42 @@ class MonsterSpawnEditor:
             self.map_canvas.delete(self.coord_text)
         if self.coord_bg:
             self.map_canvas.delete(self.coord_bg)
-        # Create background rectangle for better visibility
-        text = f"X:{map_x} Y:{map_y}"
+        
+        # Format text with fixed width for better alignment
+        text = f"X: {map_x:3d}  Y: {map_y:3d}"
+        
+        # Calculate text size (approximation) for better background sizing
+        text_width = len(text) * 7  # Approximate width based on characters
+        text_height = 20  # Fixed height for text
+        
+        # Create background rectangle with ample padding
         self.coord_bg = self.map_canvas.create_rectangle(
-            event.x + 10, event.y - 20,
-            event.x + 100, event.y - 5,
-            fill="black",
-            outline="white",
+            event.x + 10, 
+            event.y - 30,
+            event.x + 10 + text_width + 10,  # Add padding
+            event.y - 30 + text_height + 10, # Add padding
+            fill="#000066",     # Ciemnogranatowe tło
+            outline="#FFFFFF",  # Biała ramka
+            width=2,           # Grubsza ramka
             tags="coords"
         )
-        # Create coordinate text with additional explanation
+        
+        # Create coordinate text centered on background
         self.coord_text = self.map_canvas.create_text(
-            event.x + 15, event.y - 12,
+            event.x + 15, 
+            event.y - 25,
             text=text,
-            fill="white",
-            font=("Arial", 10, "bold"),
+            fill="#FFFFFF",     # Biały tekst
+            font=("Arial", 12, "bold"),
             anchor="nw",
             tags="coords"
         )
+        
         # Make sure the coordinate display is always on top
         self.map_canvas.tag_raise("coords")
+        
+        # Zapisz ostatnio wyświetlane współrzędne, aby można było ich użyć później
+        self.last_displayed_coords = (map_x, map_y)
 
     def on_mouse_down(self, event):
         # Usuwaj wszystkie tooltipy przy każdym kliknięciu na mapie
@@ -893,8 +1212,17 @@ class MonsterSpawnEditor:
             self.select_spawn_in_list(nearest_idx)
             self.clicked_existing_spawn = True
             return
+        
+        # Zapisz współrzędne kursora dla funkcji dodającej spawn
         self.start_x = self.map_canvas.canvasx(event.x)
         self.start_y = self.map_canvas.canvasy(event.y)
+        # Zapisz też aktualne współrzędne mapy wyświetlane w tooltipie
+        if hasattr(self, 'last_displayed_coords'):
+            self.start_map_coords = self.last_displayed_coords
+        else:
+            # Jeśli z jakiegoś powodu nie ma zapisanych współrzędnych, oblicz je
+            self.start_map_coords = self.canvas_to_map_coords(event.x, event.y)
+        
         self.is_selecting = True
 
     def find_nearest_spawn(self, canvas_x, canvas_y, max_distance=8):
@@ -948,9 +1276,15 @@ class MonsterSpawnEditor:
             return  # Nie pokazuj messageboxa, po prostu ignoruj
         if not hasattr(self, 'selected_monster_id'):
             return  # Nie pokazuj messageboxa, po prostu ignoruj
-        map_x, map_y = self.canvas_to_map_coords(canvas_x, canvas_y)
+        
+        # Użyj dokładnie tych samych współrzędnych, które były wyświetlane w tooltipie
+        if hasattr(self, 'start_map_coords'):
+            map_x, map_y = self.start_map_coords
+        else:
+            map_x, map_y = self.canvas_to_map_coords(canvas_x, canvas_y)
+        
         self.add_spawn(map_x, map_y)
-        print(f"add_single_spawn: ({map_x}, {map_y})")
+        print(f"add_single_spawn: Using coords from tooltip: ({map_x}, {map_y})")
         messagebox.showinfo("Info", f"Added spawn at X:{map_x} Y:{map_y}")
 
     def generate_random_spawns(self, start_x, start_y, end_x, end_y):
@@ -958,9 +1292,20 @@ class MonsterSpawnEditor:
             return  # Nie pokazuj messageboxa, po prostu ignoruj
         if not hasattr(self, 'selected_monster_id'):
             return  # Nie pokazuj messageboxa, po prostu ignoruj
-        # Convert canvas coordinates to map coordinates
-        start_map_x, start_map_y = self.canvas_to_map_coords(start_x, start_y)
-        end_map_x, end_map_y = self.canvas_to_map_coords(end_x, end_y)
+        
+        # Używaj dokładnie tych współrzędnych, które były pokazywane w tooltipie
+        if hasattr(self, 'start_map_coords'):
+            start_map_x, start_map_y = self.start_map_coords
+        else:
+            # Konwertuj współrzędne canvas do współrzędnych mapy
+            start_map_x, start_map_y = self.canvas_to_map_coords(start_x, start_y)
+        
+        # Dla end_x, end_y również używaj aktualnych współrzędnych z podglądu
+        if hasattr(self, 'last_displayed_coords'):
+            end_map_x, end_map_y = self.last_displayed_coords
+        else:
+            end_map_x, end_map_y = self.canvas_to_map_coords(end_x, end_y)
+        
         monster_id = self.selected_monster_id
         # Check if it's an NPC
         if self.monsters[monster_id]['type'] == 0:
@@ -980,6 +1325,9 @@ class MonsterSpawnEditor:
             messagebox.showinfo("Info", f"Added spawn area: X:{min(start_map_x, end_map_x)}-{max(start_map_x, end_map_x)} Y:{min(start_map_y, end_map_y)}-{max(start_map_y, end_map_y)}")
 
     def add_spawn(self, x, y, end_x=None, end_y=None):
+        # Save current state before adding
+        self.save_state("Add Spawn")
+        
         # Używaj zapamiętanych wyborów
         monster_id = getattr(self, 'selected_monster_id', None)
         map_file = getattr(self, 'selected_map_file', None)
@@ -1015,6 +1363,11 @@ class MonsterSpawnEditor:
         self.spawns.append(spawn)
         self.display_spawns()
         self.update_spawn_list()
+        
+        # Mark map as modified
+        if hasattr(self, 'selected_map_file'):
+            self.modified_maps.add(self.selected_map_file)
+            self.update_modified_indicator()
 
     def display_spawns(self):
         """Display all spawns on the map unless hide_mobs is checked"""
@@ -1298,6 +1651,12 @@ class MonsterSpawnEditor:
                            f"{spawn['x']:<14}{spawn['y']:<14}{spawn['end_x']:<14}{spawn['end_y']:<14}"
                            f"{spawn['direction']:<14}{spawn['quantity']:<14}//{monster_name}\n")
                 f.write("end\n")
+                
+            # Remove from modified maps list after saving
+            if map_file in self.modified_maps:
+                self.modified_maps.remove(map_file)
+                self.update_modified_indicator()
+                
             messagebox.showinfo("Success", "Changes saved successfully")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save changes: {str(e)}")
@@ -1309,8 +1668,42 @@ class MonsterSpawnEditor:
             # Nie ładuj ponownie tej samej mapy
             if hasattr(self, 'selected_map_file') and self.selected_map_file == map_file:
                 return
+                
+            # Check if current map has unsaved changes and save them to memory
+            if hasattr(self, 'selected_map_file') and self.selected_map_file:
+                self.save_map_to_memory(self.selected_map_file)
+                
             self.selected_map_file = map_file
-            self.load_map(map_file)
+            
+            # Check if we already have spawns for this map in memory
+            if map_file in self.map_spawns:
+                # Load from memory
+                print(f"Loading map {map_file} from memory")
+                self.spawns = copy.deepcopy(self.map_spawns[map_file])
+                
+                # Clear undo/redo stacks when switching maps
+                self.undo_stack = []
+                self.redo_stack = []
+                self.update_undo_redo_states()
+                
+                # Load map image and display spawns
+                map_name = map_file.split(" - ")[1].split(".")[0]
+                image_path = self.find_map_image(map_name)
+                self.display_map_image(image_path)
+                self.display_spawns()
+                self.update_spawn_list()
+                
+                # Update status bar
+                if map_file in self.modified_maps:
+                    self.status_var.set(f"Loaded modified map: {map_file}")
+                else:
+                    self.status_var.set(f"Loaded map: {map_file}")
+            else:
+                # Load from file
+                self.load_map(map_file)
+                
+            # Update modified indicator
+            self.update_modified_indicator()
 
     def update_spawn_list(self, *args):
         """Update the spawn list with current spawns, with search filter"""
@@ -1377,6 +1770,9 @@ class MonsterSpawnEditor:
     def delete_selected_spawn(self):
         """Delete the currently selected spawn"""
         if hasattr(self, 'selected_spawn_index') and self.selected_spawn_index >= 0:
+            # Save current state before deleting
+            self.save_state("Remove Spawn")
+            
             # Remove the spawn
             del self.spawns[self.selected_spawn_index]
             self.selected_spawn_index = -1
@@ -1384,6 +1780,11 @@ class MonsterSpawnEditor:
             # Update the display
             self.update_spawn_list()
             self.display_spawns()
+            
+            # Mark map as modified
+            if hasattr(self, 'selected_map_file'):
+                self.modified_maps.add(self.selected_map_file)
+                self.update_modified_indicator()
 
     def toggle_mobs_visibility(self):
         """Toggle the visibility of mobs on the map"""
@@ -1456,7 +1857,7 @@ Tips:
     def show_about(self):
         about_text = """
 Monster & MonsterSetBase Editor
-Version: Alpha 0.1
+Version: 1.01
 Dedicated for Season 6 files by Louis
 
 Created by Shizoo
@@ -1464,6 +1865,390 @@ Created by Shizoo
 A visual editor for MU Online monster spawn files.
         """
         messagebox.showinfo("About", about_text)
+
+    def update_spawn_coordinates(self):
+        """Update the coordinates of the selected spawn"""
+        if not hasattr(self, 'selected_spawn_index') or self.selected_spawn_index < 0:
+            messagebox.showwarning("Warning", "No spawn selected to update")
+            return
+            
+        try:
+            # Save current state before updating
+            self.save_state("Update Coordinates")
+            
+            # Pobierz wartości z pól
+            x = self.spawn_x_var.get()
+            y = self.spawn_y_var.get()
+            end_x = self.spawn_end_x_var.get()
+            end_y = self.spawn_end_y_var.get()
+            
+            # Sprawdź poprawność wartości
+            if not (0 <= x <= 255 and 0 <= y <= 255 and 0 <= end_x <= 255 and 0 <= end_y <= 255):
+                messagebox.showwarning("Warning", "Coordinates must be between 0 and 255")
+                return
+                
+            # Aktualizuj spawn
+            self.spawns[self.selected_spawn_index]['x'] = x
+            self.spawns[self.selected_spawn_index]['y'] = y
+            self.spawns[self.selected_spawn_index]['end_x'] = end_x
+            self.spawns[self.selected_spawn_index]['end_y'] = end_y
+            
+            # Dla NPCs end_x i end_y powinny być równe x i y
+            if self.spawns[self.selected_spawn_index]['type'] == 0:
+                self.spawns[self.selected_spawn_index]['end_x'] = x
+                self.spawns[self.selected_spawn_index]['end_y'] = y
+            
+            # Zaktualizuj kierunek i ilość jeśli są dostępne w interfejsie
+            if hasattr(self, 'direction_var'):
+                self.spawns[self.selected_spawn_index]['direction'] = self.direction_var.get()
+                
+            if hasattr(self, 'quantity_var') and self.spawns[self.selected_spawn_index]['type'] != 0:
+                self.spawns[self.selected_spawn_index]['quantity'] = self.quantity_var.get()
+                
+            # Odśwież listę i wyświetlanie
+            self.update_spawn_list()
+            self.display_spawns()
+            
+            # Mark map as modified
+            if hasattr(self, 'selected_map_file'):
+                self.modified_maps.add(self.selected_map_file)
+                self.update_modified_indicator()
+                
+            messagebox.showinfo("Success", f"Spawn coordinates updated to X:{x} Y:{y}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to update spawn coordinates: {str(e)}")
+
+    def on_spawn_selected(self, event):
+        """Handle spawn selection in the list"""
+        selection = self.spawn_listbox.curselection()
+        if not selection:
+            return
+            
+        selected_text = self.spawn_listbox.get(selection[0])
+        if selected_text.startswith("==="):
+            return
+            
+        # Find the corresponding spawn
+        spawn_index = -1
+        for i, spawn in enumerate(self.spawns):
+            monster_name = self.monsters.get(spawn['monster_id'], {}).get('name', "Unknown")
+            
+            if spawn['type'] == 0:  # NPC
+                if f"🧍 {monster_name} at ({spawn['x']}, {spawn['y']})" == selected_text:
+                    spawn_index = i
+                    break
+            else:  # Monster or Trap
+                type_icon = "⚠️" if spawn['type'] == 1 else "👹"
+                if f"{type_icon} {monster_name} - Qty: {spawn['quantity']} - Area: ({spawn['x']}, {spawn['y']}) to ({spawn['end_x']}, {spawn['end_y']})" == selected_text:
+                    spawn_index = i
+                    break
+        
+        if spawn_index >= 0:
+            # Highlight the selected spawn on the map
+            self.selected_spawn_index = spawn_index
+            self.display_spawns()
+            
+            # Pobierz dane wybranego spawna
+            spawn = self.spawns[spawn_index]
+            monster_id = spawn['monster_id']
+            
+            # Aktualizuj pola koordynatów
+            self.spawn_x_var.set(spawn['x'])
+            self.spawn_y_var.set(spawn['y'])
+            self.spawn_end_x_var.set(spawn['end_x'])
+            self.spawn_end_y_var.set(spawn['end_y'])
+            
+            # Aktualizuj inne pola, jeśli są dostępne w interfejsie
+            if hasattr(self, 'direction_var'):
+                self.direction_var.set(spawn['direction'])
+                self.update_direction_label()
+                
+            if hasattr(self, 'quantity_var'):
+                self.quantity_var.set(spawn['quantity'])
+                
+            if hasattr(self, 'mob_type_var'):
+                self.mob_type_var.set(spawn['type'])
+            
+            # Pokaż ramkę z koordynatami
+            if hasattr(self, 'spawn_coords_frame'):
+                self.spawn_coords_frame.grid()
+                
+            # Załaduj również statystyki moba, jeśli dostępne
+            if monster_id in self.monster_stats:
+                monster_data = self.monster_stats[monster_id]
+                for key, var in self.stat_vars.items():
+                    if key in monster_data:
+                        var.set(str(monster_data[key]))
+                        
+            # Aktualizuj selected_monster_id, aby wiedzieć, który potwór jest aktualnie wybrany
+            self.selected_monster_id = monster_id
+
+    def on_window_resize(self, event):
+        """Handle window resize to update map scaling"""
+        # Ignore events from other widgets
+        if event.widget == self.root:
+            # Only update if we have a map loaded
+            if hasattr(self, 'original_image') and self.original_image:
+                self.update_map_scale()
+
+    def update_map_scale(self):
+        """Update map scale based on current canvas size"""
+        if not hasattr(self, 'original_image') or not self.original_image:
+            return
+            
+        # Get current canvas dimensions
+        canvas_width = self.map_canvas.winfo_width()
+        canvas_height = self.map_canvas.winfo_height()
+        
+        # Skip if canvas size not yet properly initialized
+        if canvas_width <= 1 or canvas_height <= 1:
+            return
+            
+        # Calculate new scale
+        scale_x = canvas_width / self.original_width
+        scale_y = canvas_height / self.original_height
+        self.scale = min(scale_x, scale_y)
+        
+        # Resize image if needed
+        if self.scale < 1:
+            new_width = int(self.original_width * self.scale)
+            new_height = int(self.original_height * self.scale)
+            resized_image = self.original_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            self.photo_image = ImageTk.PhotoImage(resized_image)
+            self.map_canvas.delete("all")
+            self.map_canvas.create_image(0, 0, image=self.photo_image, anchor="nw")
+            self.map_canvas.configure(scrollregion=(0, 0, new_width, new_height))
+        
+        # Redisplay spawns with updated scale
+        self.display_spawns()
+
+    def toggle_mobs_visibility_menu(self):
+        """Toggle visibility of mobs from menu"""
+        self.hide_mobs_var.set(not self.view_mobs_var.get())
+        self.toggle_mobs_visibility()
+
+    def zoom_in(self):
+        """Increase map zoom by 20%"""
+        if hasattr(self, 'scale') and self.scale > 0:
+            self.scale = min(self.scale * 1.2, 5.0)  # Limit zoom in to 500%
+            self.update_scale_display()
+            self.update_map_with_scale()
+
+    def zoom_out(self):
+        """Decrease map zoom by 20%"""
+        if hasattr(self, 'scale') and self.scale > 0:
+            self.scale = max(self.scale * 0.8, 0.1)  # Limit zoom out to 10%
+            self.update_scale_display()
+            self.update_map_with_scale()
+
+    def reset_zoom(self):
+        """Reset zoom to 100%"""
+        if hasattr(self, 'scale'):
+            self.scale = 1.0
+            self.update_scale_display()
+            self.update_map_with_scale()
+
+    def update_scale_display(self):
+        """Update scale indicator in status bar"""
+        if hasattr(self, 'scale_var'):
+            scale_percent = int(self.scale * 100)
+            self.scale_var.set(f"Scale: {scale_percent}%")
+
+    def update_map_with_scale(self):
+        """Update map display with current scale"""
+        if not hasattr(self, 'original_image') or not self.original_image:
+            return
+            
+        self.map_canvas.delete("all")
+        
+        # Resize image based on scale
+        new_width = int(self.original_width * self.scale)
+        new_height = int(self.original_height * self.scale)
+        
+        if new_width > 0 and new_height > 0:
+            try:
+                resized_image = self.original_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                self.photo_image = ImageTk.PhotoImage(resized_image)
+                self.map_canvas.create_image(0, 0, image=self.photo_image, anchor="nw")
+                self.map_canvas.configure(scrollregion=(0, 0, new_width, new_height))
+                
+                # Wyświetl spawny z nową skalą
+                self.display_spawns()
+            except Exception as e:
+                print(f"Error scaling image: {e}")
+
+    # Add these new methods for undo/redo functionality
+    def save_state(self, action_name):
+        """Save current state to undo stack"""
+        print(f"Saving state: {action_name}")  # Debug
+        
+        # Create a copy of current spawns for the undo stack
+        current_state = {
+            'spawns': copy.deepcopy(self.spawns),
+            'action': action_name,
+            'selected_spawn_index': getattr(self, 'selected_spawn_index', -1)
+        }
+        
+        # Add to undo stack and clear redo stack (since we're creating a new action path)
+        self.undo_stack.append(current_state)
+        self.redo_stack.clear()
+        
+        # Limit the size of the undo stack
+        if len(self.undo_stack) > self.max_history:
+            self.undo_stack.pop(0)
+        
+        # Update menu states
+        self.update_undo_redo_states()
+        
+        # Update status bar
+        self.status_var.set(f"Action: {action_name}")
+        
+        # Mark map as modified
+        if hasattr(self, 'selected_map_file'):
+            self.modified_maps.add(self.selected_map_file)
+            self.update_modified_indicator()
+
+    def update_undo_redo_states(self):
+        """Update the enabled/disabled state of undo/redo menu items"""
+        if hasattr(self, 'edit_menu'):
+            try:
+                # Update Undo state
+                if self.undo_stack:
+                    action = self.undo_stack[-1]['action']
+                    self.edit_menu.entryconfigure(self.undo_index, state="normal")
+                    self.edit_menu.entryconfigure(self.undo_index, label=f"Undo {action}")
+                else:
+                    self.edit_menu.entryconfigure(self.undo_index, state="disabled")
+                    self.edit_menu.entryconfigure(self.undo_index, label="Undo")
+                
+                # Update Redo state
+                if self.redo_stack:
+                    action = self.redo_stack[-1]['action']
+                    self.edit_menu.entryconfigure(self.redo_index, state="normal")
+                    self.edit_menu.entryconfigure(self.redo_index, label=f"Redo {action}")
+                else:
+                    self.edit_menu.entryconfigure(self.redo_index, state="disabled")
+                    self.edit_menu.entryconfigure(self.redo_index, label="Redo")
+            except Exception as e:
+                print(f"Error updating menu state: {e}")
+                # Don't let a menu error crash the whole application
+
+    def undo(self):
+        """Restore the previous state from undo stack"""
+        print("Undo called")  # Debug
+        if not self.undo_stack:
+            print("Undo stack empty")  # Debug
+            return
+        
+        # Get the current state for the redo stack
+        current_state = {
+            'spawns': copy.deepcopy(self.spawns),
+            'action': self.undo_stack[-1]['action'],
+            'selected_spawn_index': getattr(self, 'selected_spawn_index', -1)
+        }
+        self.redo_stack.append(current_state)
+        
+        # Restore the previous state
+        previous_state = self.undo_stack.pop()
+        self.spawns = previous_state['spawns']
+        if 'selected_spawn_index' in previous_state:
+            self.selected_spawn_index = previous_state['selected_spawn_index']
+        
+        # Update display
+        self.display_spawns()
+        self.update_spawn_list()
+        
+        # Update menu states
+        self.update_undo_redo_states()
+        
+        # Update status bar
+        self.status_var.set(f"Undid: {previous_state['action']}")
+        print(f"Undid: {previous_state['action']}")  # Debug
+
+    def redo(self):
+        """Restore the next state from redo stack"""
+        print("Redo called")  # Debug
+        if not self.redo_stack:
+            print("Redo stack empty")  # Debug
+            return
+        
+        # Get the current state for the undo stack
+        current_state = {
+            'spawns': copy.deepcopy(self.spawns),
+            'action': self.redo_stack[-1]['action'],
+            'selected_spawn_index': getattr(self, 'selected_spawn_index', -1)
+        }
+        self.undo_stack.append(current_state)
+        
+        # Restore the next state
+        next_state = self.redo_stack.pop()
+        self.spawns = next_state['spawns']
+        if 'selected_spawn_index' in next_state:
+            self.selected_spawn_index = next_state['selected_spawn_index']
+        
+        # Update display
+        self.display_spawns()
+        self.update_spawn_list()
+        
+        # Update menu states
+        self.update_undo_redo_states()
+        
+        # Update status bar
+        self.status_var.set(f"Redid: {next_state['action']}")
+        print(f"Redid: {next_state['action']}")  # Debug
+
+    def save_map_to_memory(self, map_file):
+        """Save current map spawns to memory"""
+        if hasattr(self, 'spawns') and self.spawns:
+            self.map_spawns[map_file] = copy.deepcopy(self.spawns)
+            print(f"Saved map {map_file} to memory with {len(self.spawns)} spawns")
+            
+            # Mark as modified if there are unsaved changes
+            if hasattr(self, 'undo_stack') and self.undo_stack:
+                self.modified_maps.add(map_file)
+
+    def on_closing(self):
+        """Handle application closing with unsaved changes check"""
+        if self.modified_maps:
+            # Format list of modified maps for display
+            modified_list = "\n".join(sorted(self.modified_maps))
+            
+            # Ask user if they want to save changes before exiting
+            result = messagebox.askyesnocancel(
+                "Unsaved Changes",
+                f"You have unsaved changes on the following maps:\n\n{modified_list}\n\nDo you want to save these changes before exiting?",
+                icon="warning"
+            )
+            
+            if result is None:  # Cancel
+                return  # Don't close the app
+            elif result:  # Yes, save changes
+                # Save current map first
+                if hasattr(self, 'selected_map_file') and self.selected_map_file in self.modified_maps:
+                    self.save_changes()
+                
+                # Prompt for saving other modified maps
+                for map_file in sorted(self.modified_maps.copy()):  # Use copy to avoid modification during iteration
+                    if not hasattr(self, 'selected_map_file') or map_file != self.selected_map_file:
+                        save_this = messagebox.askyesno(
+                            "Save Map",
+                            f"Save changes to {map_file}?",
+                            icon="question"
+                        )
+                        if save_this:
+                            # Switch to this map temporarily and save it
+                            self.save_map_to_memory(self.selected_map_file)  # Save current map state
+                            old_map = self.selected_map_file
+                            self.selected_map_file = map_file
+                            self.spawns = copy.deepcopy(self.map_spawns[map_file])
+                            self.save_changes()
+                            
+                            # Switch back to original map
+                            self.selected_map_file = old_map
+                            self.spawns = copy.deepcopy(self.map_spawns[old_map])
+        
+        # Close the application
+        self.root.destroy()
 
 def main():
     root = tk.Tk()
